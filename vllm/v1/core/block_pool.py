@@ -452,13 +452,15 @@ class BlockPool:
         kv_cache_group_id: int,
         block_size: int,
         replace_existing_hashes: bool = False,
+        register_all_hash_boundaries: bool = False,
     ) -> BlockHashWithGroupId | None:
-        """Register a partial prefix-cache entry for an existing block.
+        """Register partial prefix-cache entries for an existing block.
 
         Prefix-cache keys normally identify full cache blocks. A partial entry
         makes an existing cache block reachable from a fine-grained prefix
         boundary inside that block without allocating or copying a new
-        ``KVCacheBlock``.
+        ``KVCacheBlock``. Full-attention groups can register each boundary in
+        the partial block so external KV events describe a dense hash chain.
 
         The partial entry is lookup metadata owned by ``block``. If ``block``
         has no primary hash, the key becomes its primary hash. If the block
@@ -482,10 +484,14 @@ class BlockPool:
             replace_existing_hashes: Whether the block contents were replaced
                 and all existing cache entries must be removed before the new
                 entry is registered.
+            register_all_hash_boundaries: Whether to register every hash
+                boundary after the start of the partial block. This keeps
+                fine-grained cache events dense for full-attention groups with
+                larger physical blocks.
 
         Returns:
-            The hash key with group ID if a partial entry can be registered;
-            otherwise ``None`` for null blocks.
+            The final boundary's hash key with group ID if partial entries can
+            be registered; otherwise ``None`` for null blocks.
 
         """
         if block.is_null:
@@ -495,15 +501,21 @@ class BlockPool:
         assert replace_existing_hashes or (
             block_size > self.hash_block_size and num_tokens % block_size != 0
         )
-        block_hash = self._get_partial_block_hash(request, num_tokens)
-        num_hash_blocks = num_tokens // self.hash_block_size
-        block_hash_with_group_id = make_block_hash_with_group_id(
-            block_hash, kv_cache_group_id
+        block_start, block_hashes = self._get_partial_block_hashes(
+            request,
+            num_tokens,
+            block_size,
+            register_all_hash_boundaries,
         )
-        already_cached = block.block_hash == block_hash_with_group_id or (
-            self.cached_block_hash_to_block.contain(
-                block_hash_with_group_id, block.block_id
-            )
+        first_hash_idx = block_start // self.hash_block_size
+        block_hashes_with_group_id = [
+            make_block_hash_with_group_id(block_hash, kv_cache_group_id)
+            for block_hash in block_hashes
+        ]
+        block_hash_with_group_id = block_hashes_with_group_id[-1]
+        already_cached = all(
+            self.cached_block_hash_to_block.contain(block_hash, block.block_id)
+            for block_hash in block_hashes_with_group_id
         )
         if replace_existing_hashes:
             removed_hashes = self._remove_cached_block_hashes(block)
@@ -513,73 +525,71 @@ class BlockPool:
             not already_cached
             and block.block_hash is not None
             and block.block_hash_num_tokens is not None
-            and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
+            and block.block_hash_num_tokens < num_tokens
         ):
             removed_hashes = self._remove_cached_block_hashes(block)
             self._emit_block_removed_events(removed_hashes)
-        self._insert_block_hash(
-            block_hash_with_group_id,
-            block,
-            num_tokens=num_hash_blocks * self.hash_block_size,
+
+        boundaries = range(
+            block_start + self.hash_block_size,
+            num_tokens + 1,
+            self.hash_block_size,
         )
+        # Keep the longest boundary as the block's primary hash.
+        for block_hash, boundary in reversed(
+            list(zip(block_hashes_with_group_id, boundaries, strict=True))
+        ):
+            self._insert_block_hash(block_hash, block, num_tokens=boundary)
+
         if self.enable_kv_cache_events and not already_cached:
-            parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
-                request, num_tokens
-            )
             parent_block_hash = (
-                maybe_convert_block_hash(parent_hash)
-                if parent_hash is not None
+                maybe_convert_block_hash(request.block_hashes[first_hash_idx - 1])
+                if first_hash_idx > 0
                 else None
             )
-            block_end = num_tokens
+            extra_keys_list: list[tuple[Any, ...] | None] = []
             curr_mm_idx = -1 if block_start > 0 else 0
-            extra_keys, _ = generate_block_hash_extra_keys(
-                request, block_start, block_end, curr_mm_idx
-            )
+            for chunk_start in range(block_start, num_tokens, self.hash_block_size):
+                extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
+                    request,
+                    chunk_start,
+                    chunk_start + self.hash_block_size,
+                    curr_mm_idx,
+                )
+                extra_keys_list.append(extra_keys)
             self.kv_event_queue.append(
-                BlockStored(
-                    block_hashes=[maybe_convert_block_hash(block_hash)],
+                self._build_block_stored_event(
+                    request,
+                    block_hashes=[
+                        maybe_convert_block_hash(block_hash)
+                        for block_hash in block_hashes
+                    ],
                     parent_block_hash=parent_block_hash,
-                    token_ids=request.all_token_ids[block_start:block_end],
-                    block_size=block_end - block_start,
-                    lora_id=request.lora_request.adapter_id
-                    if request.lora_request
-                    else None,
-                    medium=self.medium,
-                    lora_name=request.lora_request.name
-                    if request.lora_request
-                    else None,
-                    extra_keys=[extra_keys],
-                    group_idx=kv_cache_group_id,
-                    session_id=request.session_id,
+                    start_token_idx=block_start,
+                    end_token_idx=num_tokens,
+                    block_size=self.hash_block_size,
+                    kv_cache_group_id=kv_cache_group_id,
+                    extra_keys_list=extra_keys_list,
                 )
             )
         return block_hash_with_group_id
 
-    def _get_partial_block_hash(
+    def _get_partial_block_hashes(
         self,
         request: Request,
         num_tokens: int,
-    ) -> BlockHash:
+        block_size: int,
+        register_all_hash_boundaries: bool,
+    ) -> tuple[int, list[BlockHash]]:
         assert num_tokens % self.hash_block_size == 0
         num_hash_blocks = num_tokens // self.hash_block_size
         assert 0 < num_hash_blocks <= len(request.block_hashes)
 
-        # Each hash_block_size hash chains over its full prefix, so the partial
-        # entry for any group block size is the hash at that prefix boundary.
-        return request.block_hashes[num_hash_blocks - 1]
-
-    def _get_partial_block_parent_hash_and_start(
-        self,
-        request: Request,
-        num_tokens: int,
-    ) -> tuple[BlockHash | None, int]:
-        num_hash_blocks = num_tokens // self.hash_block_size
-        parent_hash = (
-            request.block_hashes[num_hash_blocks - 2] if num_hash_blocks > 1 else None
-        )
-        block_start = (num_hash_blocks - 1) * self.hash_block_size
-        return parent_hash, block_start
+        block_start = num_tokens - self.hash_block_size
+        if register_all_hash_boundaries:
+            block_start = num_tokens // block_size * block_size
+        first_hash_idx = block_start // self.hash_block_size
+        return block_start, request.block_hashes[first_hash_idx:num_hash_blocks]
 
     def _remove_cached_block_hashes(
         self,

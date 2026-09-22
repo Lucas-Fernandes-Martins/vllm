@@ -173,6 +173,92 @@ def test_cache_partial_block_kv_cache_events():
     assert removed_event.group_idx == kv_cache_group_id
 
 
+def test_cache_partial_block_emits_all_registered_hashes():
+    hash_block_size = 2
+    block_size = 6
+    kv_cache_group_id = 2
+    req = make_request(
+        "req_partial_alias_events",
+        prompt_token_ids=list(range(10)),
+        hash_block_size=hash_block_size,
+        hash_fn=sha256,
+        session_id="agent-session-partial-aliases",
+    )
+    pool = BlockPool(
+        num_gpu_blocks=3,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        enable_kv_cache_events=True,
+    )
+    blocks = pool.get_new_blocks(2)
+
+    pool.cache_full_blocks(
+        request=req,
+        blocks=blocks,
+        num_cached_blocks=0,
+        num_full_blocks=1,
+        block_size=block_size,
+        kv_cache_group_id=kv_cache_group_id,
+    )
+    pool.take_events()
+
+    partial_entry_hash = pool.cache_partial_block(
+        request=req,
+        block=blocks[1],
+        num_tokens=10,
+        kv_cache_group_id=kv_cache_group_id,
+        block_size=block_size,
+        register_all_hash_boundaries=True,
+    )
+
+    expected_hashes = [
+        boundary_hash(req, hash_block_size, 8),
+        boundary_hash(req, hash_block_size, 10),
+    ]
+    assert partial_entry_hash == kv_cache_utils.make_block_hash_with_group_id(
+        expected_hashes[-1], kv_cache_group_id
+    )
+    assert blocks[1].block_hash == partial_entry_hash
+    assert blocks[1].block_hash_num_tokens == 10
+    for block_hash in expected_hashes:
+        assert pool.get_cached_block(block_hash, [kv_cache_group_id]) == [blocks[1]]
+
+    events = pool.take_events()
+    assert len(events) == 1
+    stored_event = events[0]
+    assert isinstance(stored_event, BlockStored)
+    assert stored_event.parent_block_hash == kv_cache_utils.maybe_convert_block_hash(
+        boundary_hash(req, hash_block_size, 6)
+    )
+    assert stored_event.block_hashes == [
+        kv_cache_utils.maybe_convert_block_hash(block_hash)
+        for block_hash in expected_hashes
+    ]
+    assert stored_event.token_ids == req.all_token_ids[6:10]
+    assert stored_event.block_size == hash_block_size
+    assert stored_event.extra_keys == [None, None]
+    assert stored_event.group_idx == kv_cache_group_id
+    assert stored_event.session_id == "agent-session-partial-aliases"
+
+    duplicate_entry_hash = pool.cache_partial_block(
+        request=req,
+        block=blocks[1],
+        num_tokens=10,
+        kv_cache_group_id=kv_cache_group_id,
+        block_size=block_size,
+        register_all_hash_boundaries=True,
+    )
+    assert duplicate_entry_hash == partial_entry_hash
+    assert pool.take_events() == []
+
+    pool.evict_blocks({blocks[1].block_id})
+    removed_events = pool.take_events()
+    assert [event.block_hashes for event in removed_events] == [
+        [kv_cache_utils.maybe_convert_block_hash(block_hash)]
+        for block_hash in reversed(expected_hashes)
+    ]
+
+
 def test_partial_block_replacement_emits_remove_then_store_events():
     hash_block_size = 2
     block_size = 6
