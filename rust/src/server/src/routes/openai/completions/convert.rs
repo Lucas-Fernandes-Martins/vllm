@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use std::num::NonZeroU32;
+
 use thiserror_ext::AsReport as _;
 use vllm_text::tokenizer::Tokenizer;
 use vllm_text::{Prompt, SamplingParams, TextDecodeOptions, TextRequest};
@@ -9,8 +11,8 @@ use super::types::CompletionRequest;
 use crate::error::{ApiError, text_submit_error};
 use crate::lora::LoraModelResolution;
 use crate::routes::openai::completions::validate;
-use crate::routes::openai::utils::resolve_generation_prompt_truncation;
 use crate::routes::openai::utils::structured_outputs::convert_from_response_format_value;
+use crate::routes::openai::utils::{resolve_generation_prompt_truncation, resolve_n};
 use crate::utils::{
     ResolvedRequestContext, convert_logit_bias, merge_ec_transfer_params, merge_kv_transfer_params,
     resolve_session_id,
@@ -24,6 +26,8 @@ pub(super) struct PreparedRequest {
     pub request_id: String,
     /// Public model ID echoed back to the client.
     pub response_model: String,
+    /// Number of choices to generate.
+    pub n: NonZeroU32,
     /// Public response rendering options for route-layer helpers.
     pub options: ResponseOptions,
     /// Lowered text request for the shared `vllm-text` facade.
@@ -46,8 +50,11 @@ pub(super) struct ResponseOptions {
     pub include_prompt_logprobs: bool,
     /// Whether to include token IDs alongside generated text.
     pub return_token_ids: bool,
-    /// Whether to format logprob tokens as `token_id:{id}`.
-    pub return_tokens_as_token_ids: bool,
+    /// The request's `return_tokens_as_token_ids`; `None` falls back to the
+    /// server's `--return-tokens-as-token-ids`.
+    pub return_tokens_as_token_ids: Option<bool>,
+    /// Whether to return the weight-version spans on each finished choice.
+    pub return_weight_versions: bool,
 }
 
 /// Validate and lower one OpenAI completions request into the internal
@@ -62,6 +69,7 @@ pub(super) fn prepare_completion_request(
     tokenizer: &dyn Tokenizer,
 ) -> Result<PreparedRequest, ApiError> {
     validate::validate_request_compat(&request, &lora_resolution.model_names)?;
+    let n = resolve_n(request.n)?;
 
     let prompt_truncation = resolve_generation_prompt_truncation(
         request.truncate_prompt_tokens,
@@ -70,20 +78,11 @@ pub(super) fn prepare_completion_request(
     .map_err(|error| text_submit_error("invalid prompt truncation", error))?;
 
     let request_id = format!("cmpl-{}", ctx.request_id);
-    let response_model = lora_resolution
-        .lora_request
-        .as_ref()
-        .map(|request| request.lora_name.clone())
-        .unwrap_or_else(|| lora_resolution.model_names.first().cloned().unwrap_or_default());
+    let response_model = lora_resolution.response_model();
 
     let logprobs = request.logprobs;
     let prompt_only = request.echo && request.max_tokens == Some(0);
-    let prompt_logprobs =
-        request.prompt_logprobs.or(if request.echo && (!request.stream || prompt_only) {
-            logprobs
-        } else {
-            None
-        });
+    let prompt_logprobs = request.prompt_logprobs.or(if request.echo { logprobs } else { None });
     let include_usage = (request.stream_options.as_ref())
         .and_then(|options| options.include_usage)
         .unwrap_or(false);
@@ -100,6 +99,12 @@ pub(super) fn prepare_completion_request(
         request.max_tokens
     };
     let echo = completion_echo_text(&request, tokenizer)?;
+    let logprob_token_ids = request.logprob_token_ids.filter(|ids| !ids.is_empty());
+    let logprobs = if logprob_token_ids.is_some() {
+        None
+    } else {
+        logprobs
+    };
 
     let structured_outputs =
         convert_from_response_format_value(&request.response_format, &request.structured_outputs)?;
@@ -135,20 +140,24 @@ pub(super) fn prepare_completion_request(
             ignore_eos: request.ignore_eos,
             logit_bias: convert_logit_bias(request.logit_bias)?,
             allowed_token_ids: request.allowed_token_ids,
-            bad_words: None,
-            logprob_token_ids: None,
+            bad_words: request.bad_words,
+            bad_words_token_ids: None,
+            logprob_token_ids,
             structured_outputs,
             skip_reading_prefix_cache: None,
+            routed_experts_prompt_start: None,
             vllm_xargs: merge_kv_transfer_params(
                 merge_ec_transfer_params(request.vllm_xargs, request.ec_transfer_params.as_ref()),
                 request.kv_transfer_params.as_ref(),
             ),
+            stream_interval: request.stream_interval,
         },
         decode_options: TextDecodeOptions {
             skip_special_tokens: request.skip_special_tokens,
             include_stop_str_in_output: request.include_stop_str_in_output,
             stop_strings: request.stop.map(|stop| stop.into_vec()),
             min_tokens: request.min_tokens.unwrap_or(0),
+            detokenize: true,
         },
         intermediate: request.stream,
         prompt_truncation,
@@ -167,6 +176,7 @@ pub(super) fn prepare_completion_request(
     Ok(PreparedRequest {
         request_id,
         response_model,
+        n,
         options: ResponseOptions {
             include_usage,
             include_continuous_usage,
@@ -175,7 +185,8 @@ pub(super) fn prepare_completion_request(
             requested_logprobs: request.logprobs,
             include_prompt_logprobs,
             return_token_ids: request.return_token_ids.unwrap_or(false),
-            return_tokens_as_token_ids: request.return_tokens_as_token_ids.unwrap_or(false),
+            return_tokens_as_token_ids: request.return_tokens_as_token_ids,
+            return_weight_versions: request.return_weight_versions.unwrap_or(false),
         },
         text_request,
     })
@@ -210,6 +221,8 @@ fn completion_echo_text(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use axum::http::HeaderMap;
     use serde_json::json;
     use validator::Validate;
@@ -218,6 +231,7 @@ mod tests {
 
     use super::prepare_completion_request;
     use crate::lora::LoraModelResolution;
+    use crate::model_names::ServedModelNames;
     use crate::routes::openai::completions::types::CompletionRequest;
     use crate::routes::openai::utils::types::Normalizable;
     use crate::utils::{ResolvedRequestContext, resolve_request_context};
@@ -228,7 +242,7 @@ mod tests {
 
     fn served(names: &[&str]) -> LoraModelResolution {
         LoraModelResolution {
-            model_names: names.iter().map(|s| s.to_string()).collect(),
+            model_names: ServedModelNames::new(names.iter().map(|s| s.to_string()).collect()),
             lora_request: None,
         }
     }
@@ -398,8 +412,10 @@ mod tests {
             "frequency_penalty": 0.2,
             "presence_penalty": 0.3,
             "repetition_penalty": 1.1,
+            "bad_words": ["hello"],
             "ignore_eos": true,
-            "skip_special_tokens": false
+            "skip_special_tokens": false,
+            "stream_interval": 4
         }))
         .expect("parse request");
 
@@ -433,8 +449,16 @@ mod tests {
             prepared.text_request.sampling_params.repetition_penalty,
             Some(1.1)
         );
+        assert_eq!(
+            prepared.text_request.sampling_params.bad_words,
+            Some(vec!["hello".to_string()])
+        );
         assert!(prepared.text_request.sampling_params.ignore_eos);
         assert!(!prepared.text_request.decode_options.skip_special_tokens);
+        assert_eq!(
+            prepared.text_request.sampling_params.stream_interval,
+            NonZeroU32::new(4)
+        );
     }
 
     #[test]
@@ -490,7 +514,7 @@ mod tests {
 
         assert!(prepared.options.include_usage);
         assert!(prepared.options.include_continuous_usage);
-        assert!(prepared.options.return_tokens_as_token_ids);
+        assert_eq!(prepared.options.return_tokens_as_token_ids, Some(true));
     }
 
     #[test]
@@ -642,6 +666,28 @@ mod tests {
             prepared.text_request.prompt,
             Prompt::TokenIds(vec![104, 101, 108, 108, 111])
         );
+    }
+
+    #[test]
+    fn selected_logprobs_override_completion_top_k_unless_empty() {
+        for ids in [vec![10, 20], vec![]] {
+            let request = serde_json::from_value(json!({
+                "prompt": "hello", "logprobs": 0, "logprob_token_ids": ids,
+            }))
+            .unwrap();
+            let prepared = prepare_completion_request(
+                request,
+                &served(&["test-model"]),
+                ResolvedRequestContext::default(),
+                &test_tokenizer(),
+            )
+            .unwrap();
+            let params = prepared.text_request.sampling_params;
+            let selected = !ids.is_empty();
+            assert_eq!(params.logprob_token_ids, selected.then_some(ids));
+            assert_eq!(params.logprobs, (!selected).then_some(0));
+            assert_eq!(prepared.options.requested_logprobs, Some(0));
+        }
     }
 
     #[test]
