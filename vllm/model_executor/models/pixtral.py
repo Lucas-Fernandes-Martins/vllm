@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from mistral_common.protocol.instruct.chunk import ImageChunk, TextChunk
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
+from mistral_common.tokens.tokenizers.image import DATASET_MEAN, DATASET_STD
 from packaging.version import Version
 from transformers import PixtralVisionConfig
 from transformers.models.pixtral.image_processing_pixtral import (
@@ -26,7 +27,7 @@ from vllm.compilation.decorators import (
     should_torch_compile_mm_encoder,
     support_torch_compile,
 )
-from vllm.config import VllmConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.config.multimodal import MultiModalConfig, MultiModalDummyOptions
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.inputs import MultiModalDataDict
@@ -34,6 +35,10 @@ from vllm.model_executor.layers.activation import SiluAndMul, get_act_and_mul_fn
 from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.fusion.fused_act_quant import maybe_fused_act_quant
+from vllm.model_executor.layers.fusion.mm_input_norm import (
+    FusedMMInputNorm,
+    IdentityInputNorm,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -71,6 +76,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.tokenizers.mistral import MistralTokenizer
 from vllm.transformers_utils.processors.pixtral import (
+    RAW_PIXEL_SCALE,
     MistralCommonImageProcessor,
     MistralCommonPixtralProcessor,
 )
@@ -605,6 +611,8 @@ class PixtralForConditionalGeneration(
     SupportsPP,
     PixtralEncoderCudaGraphMixin,
 ):
+    supports_mm_device_do_normalize = True
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_regex={
             re.compile(
@@ -685,6 +693,7 @@ class PixtralForConditionalGeneration(
         with self._mark_tower_model(vllm_config, "image"):
             self.vision_encoder = VisionTransformer(
                 self.vision_args,
+                input_norm=build_mistral_common_input_norm(vllm_config.model_config),
                 prefix=maybe_prefix(prefix, "vision_encoder"),
             )
             self.pre_mm_projector_norm = (
@@ -1266,15 +1275,30 @@ class Transformer(nn.Module):
         return x
 
 
+def build_mistral_common_input_norm(model_config: ModelConfig) -> nn.Module:
+    """Normalize the int16 pixels of `MistralCommonImageProcessor` on device."""
+    if not model_config.get_multimodal_config().mm_device_do_normalize:
+        return IdentityInputNorm()
+    return FusedMMInputNorm(
+        image_mean=list(DATASET_MEAN),
+        image_std=list(DATASET_STD),
+        rescale_factor=1 / (255 * RAW_PIXEL_SCALE),
+        input_dtype=torch.int16,
+    )
+
+
 class VisionTransformer(nn.Module):
     def __init__(
         self,
         args: VisionEncoderArgs,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        input_norm: nn.Module | None = None,
     ):
         super().__init__()
         self.args = args
+        self.input_norm = input_norm
         disable_tp = is_vit_use_data_parallel()
         self.patch_conv = Conv2dLayer(
             in_channels=args.num_channels,
@@ -1376,15 +1400,17 @@ class VisionTransformer(nn.Module):
     ) -> torch.Tensor:
         """Encode images packed by `pack_image_patches`.
 
-        `patches` holds (N_toks, C * patch_size**2) pixel patches and
-        `positions` their (N_toks, 2) (row, col) coordinates; the attention
-        arguments come from `packed_attention_metadata`. Returns (N_toks, D)
-        token features.
+        `patches` holds (N_toks, C * patch_size**2) pixel patches (raw pixels
+        when `input_norm` normalizes on device) and `positions` their
+        (N_toks, 2) (row, col) coordinates; the attention arguments come from
+        `packed_attention_metadata`. Returns (N_toks, D) token features.
         """
         weight = self.patch_conv.weight
-        patch_embeds = F.linear(
-            patches.to(weight.dtype), weight.reshape(weight.shape[0], -1)
-        )
+        if self.input_norm is not None:
+            patches = self.input_norm(patches, weight.dtype)
+        else:
+            patches = patches.to(weight.dtype)
+        patch_embeds = F.linear(patches, weight.reshape(weight.shape[0], -1))
         patch_embeds = self.ln_pre(patch_embeds.unsqueeze(0))
         freqs_cis = self.freqs_cis[positions[:, 0], positions[:, 1]]
         out = self.transformer(

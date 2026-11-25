@@ -58,7 +58,7 @@ with:
     weight[c] = rescale_factor / image_std[c]
     bias[c]   = -image_mean[c] / image_std[c]
 
-The kernel accepts `uint8`, `float16`, `bfloat16` and `float32` inputs. The `uint8` path is the primary fast path: raw bytes travel to the device unprocessed, and the rescale factor is folded into `weight` — no separate divide-by-255 step. Compute is always done in fp32 inside the kernel.
+The kernel accepts `uint8`, `int16`, `float16`, `bfloat16` and `float32` inputs. The `uint8` path is the primary fast path: raw bytes travel to the device unprocessed, and the rescale factor is folded into `weight` — no separate divide-by-255 step. Compute is always done in fp32 inside the kernel. `PixtralForConditionalGeneration` sends `int16` pixels scaled by 64 instead: `mistral_common` resizes in float32, and `uint8` would clip the bicubic overshoot outside `[0, 255]`.
 
 #### Optimized Data Path
 
@@ -98,6 +98,7 @@ GPU-side fusion is controlled by `multimodal_config.mm_device_do_normalize`:
 | `nano-nemotron-omni`       | `NemotronH_Nano_Omni_Reasoning_V3`            | `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4` |
 | `nemotron-omni`            | `NemotronH_Omni_Reasoning_V3`                 | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` |
 | `nemotron-parse`           | `NemotronParseForConditionalGeneration`       | `nvidia/NVIDIA-Nemotron-Parse-2.0`, etc.              |
+| `pixtral`                  | `PixtralForConditionalGeneration`             | `mistralai/Pixtral-12B-2409`, etc.                    |
 | `qwen2-vl`                 | `Qwen2VLForConditionalGeneration`             | `Qwen/Qwen2-VL-2B-Instruct`, etc.                     |
 | `qwen2.5-omni`             | `Qwen2_5OmniThinkerForConditionalGeneration`  | `Qwen/Qwen2.5-Omni-3B`, etc.                          |
 | `qwen2.5-vl`               | `Qwen2_5_VLForConditionalGeneration`          | `Qwen/Qwen2.5-VL-3B-Instruct`, etc.                   |

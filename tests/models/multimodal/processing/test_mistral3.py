@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for Mistral3's and Pixtral (HF)'s multimodal preprocessing kwargs."""
+"""Tests for Mistral3's and Pixtral's multimodal preprocessing kwargs."""
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
+from mistral_common.tokens.tokenizers.image import DATASET_STD
 from PIL import Image
 from transformers import AutoProcessor, BatchFeature, PreTrainedConfig
 from transformers.models.pixtral import PixtralProcessor
 
+from vllm.config.multimodal import MultiModalDummyOptions
 from vllm.model_executor.layers.fusion.mm_input_norm import (
     FusedMMInputNorm,
     IdentityInputNorm,
@@ -21,11 +24,14 @@ from vllm.model_executor.models.lightonocr import (
 from vllm.model_executor.models.mistral3 import Mistral3HFEncoderInfo
 from vllm.model_executor.models.pixtral import (
     PixtralHFEncoderInfo,
+    PixtralMultiModalProcessor,
+    build_mistral_common_input_norm,
     pixtral_patch_embed,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalKwargsItems
 from vllm.platforms import current_platform
+from vllm.transformers_utils.processors.pixtral import RAW_PIXEL_SCALE
 from vllm.triton_utils import HAS_TRITON
 
 from ...utils import build_model_context
@@ -329,6 +335,58 @@ def test_mm_device_do_normalize():
         output = input_norm(pack_patches(raw).to(device), normalized.dtype)
         torch.testing.assert_close(
             output, pack_patches(normalized).to(device), rtol=1e-5, atol=1e-6
+        )
+
+
+@pytest.mark.usefixtures("default_vllm_config")
+def test_mistral_common_mm_device_do_normalize():
+    """int16 pixels normalized on device match mistral_common's float32
+    preprocessing, up to rounding the resized pixels to int16."""
+    ctx = build_model_context(
+        _MODEL_ID, dtype="float32", limit_mm_per_prompt={"image": 2}
+    )
+    assert ctx.model_config.architecture == "PixtralForConditionalGeneration"
+    assert ctx.model_config.multimodal_config.mm_device_do_normalize
+    processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config)
+    assert isinstance(processor, PixtralMultiModalProcessor)
+
+    rng = np.random.RandomState(0)
+    images = [
+        Image.fromarray(rng.randint(0, 256, (470, 310, 3), dtype=np.uint8)),
+        Image.fromarray(rng.randint(0, 256, (32, 48, 4), dtype=np.uint8)),
+    ]
+    inputs = processor.get_dummy_inputs(
+        ctx.model_config.max_model_len,
+        {"image": len(images)},
+        mm_options=MultiModalDummyOptions(),
+        mm_data={"image": images},
+    )
+
+    def run(device_normalize: bool) -> list[torch.Tensor]:
+        ctx.model_config.multimodal_config.mm_device_do_normalize = device_normalize
+        out = processor(inputs.prompt, mm_items=inputs.mm_data_items)
+        values = out["mm_kwargs"].get_data()["images"]
+        assert isinstance(values, list)
+        assert all(isinstance(value, torch.Tensor) for value in values)
+        return values
+
+    normalized = run(False)
+    raw = run(True)
+    device = torch.device(current_platform.device_type)
+    input_norm = build_mistral_common_input_norm(ctx.model_config).to(device)
+    # Half an int16 step from rounding the resized pixels, plus float32
+    # rounding of the fused multiply-add.
+    atol = 0.5 / RAW_PIXEL_SCALE / 255 / min(DATASET_STD) + 1e-6
+
+    for raw_image, normalized_image in zip(raw, normalized):
+        assert raw_image.dtype == torch.int16
+        assert normalized_image.dtype == torch.float32
+        output = input_norm(raw_image.reshape(1, -1).to(device), torch.float32)
+        torch.testing.assert_close(
+            output.reshape(raw_image.shape),
+            normalized_image.to(device),
+            rtol=0,
+            atol=atol,
         )
 
 
