@@ -63,3 +63,19 @@ def test_fetch_images_rejects_unsupported_type(
 ):
     with pytest.raises(TypeError, match="only a single or a list"):
         image_processor.fetch_images(42)
+
+
+@pytest.mark.parametrize(
+    ("do_rescale", "do_normalize"), [(False, None), (None, False), (True, False)]
+)
+def test_call_rejects_partial_device_normalize(
+    image_processor: MistralCommonImageProcessor,
+    do_rescale: bool | None,
+    do_normalize: bool | None,
+):
+    with pytest.raises(ValueError, match="must be disabled together"):
+        image_processor(
+            Image.new("RGB", (4, 4)),
+            do_rescale=do_rescale,
+            do_normalize=do_normalize,
+        )

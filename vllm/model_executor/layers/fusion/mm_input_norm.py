@@ -225,9 +225,9 @@ class FusedMMInputNorm(CustomOp):
     Dtype semantics:
 
     * Input dtype — the dtype of the `pixel_values` argument to `forward_*`.
-      It is `uint8` when `mm_device_do_normalize` is enabled (raw bytes
-      travel to the device unprocessed) and equals `visual_dtype`
-      otherwise.
+      It is `input_dtype` (`uint8` by default) when
+      `mm_device_do_normalize` is enabled (raw pixels travel to the device
+      unprocessed) and equals `visual_dtype` otherwise.
     * Output dtype — the `visual_dtype` argument of `forward_*`. The
       computation itself is always fp32, independent of the output dtype
       (e.g. compute fp32, emit bf16).
@@ -256,6 +256,7 @@ class FusedMMInputNorm(CustomOp):
         rescale_factor: float,
         channel: int = 3,
         layout: InputLayout = "pcl",
+        input_dtype: torch.dtype = torch.uint8,
     ):
         super().__init__()
 
@@ -267,6 +268,7 @@ class FusedMMInputNorm(CustomOp):
 
         self.channel = channel
         self.layout = _validate_layout(layout)
+        self._input_dtype = input_dtype
 
         # Model construction can set the accelerator as PyTorch's default
         # device; build the buffers on CPU first, then move them over.
@@ -285,7 +287,7 @@ class FusedMMInputNorm(CustomOp):
 
     @property
     def input_dtype(self) -> torch.dtype | None:
-        return torch.uint8
+        return self._input_dtype
 
     # ------------------------------------------------------------------
     # Internal helpers shared by the platform-specific forward_* methods

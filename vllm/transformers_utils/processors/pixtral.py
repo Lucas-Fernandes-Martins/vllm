@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import numpy as np
 import torch
 from mistral_common.protocol.instruct.chunk import ImageChunk
+from mistral_common.tokens.tokenizers.image import _convert_to_rgb
 from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
 from PIL import Image
 from transformers import BatchFeature, ImageProcessingMixin, ProcessorMixin, TensorType
 from transformers.image_utils import ImageInput
 
 from vllm.tokenizers.mistral import MistralTokenizer
+
+# Unnormalized pixels are int16 fixed point: value * RAW_PIXEL_SCALE. Unlike
+# uint8, this keeps the bicubic overshoot outside [0, 255] that mistral_common's
+# float32 resize produces.
+RAW_PIXEL_SCALE = 64
 
 
 class MistralCommonImageProcessor(ImageProcessingMixin):
@@ -22,19 +29,49 @@ class MistralCommonImageProcessor(ImageProcessingMixin):
         self,
         images: ImageInput,
         return_tensors: str | TensorType | None = None,
+        do_rescale: bool | None = None,
+        do_normalize: bool | None = None,
         **kwargs,
     ) -> BatchFeature:
+        """With `do_rescale=False` and `do_normalize=False`, return resized
+        int16 pixels scaled by `RAW_PIXEL_SCALE` for normalization on device.
+        """
+        raw = do_rescale is False
+        if raw != (do_normalize is False):
+            raise ValueError(
+                "do_rescale and do_normalize must be disabled together, got "
+                f"{do_rescale=}, {do_normalize=}"
+            )
+
         images_lst = [images] if not isinstance(images, list) else images
 
         images_processed = list[torch.Tensor]()
 
         for image in images_lst:
-            image_inputs = self.mm_encoder(ImageChunk(image=image))
-            image_processed = torch.tensor(image_inputs.image)
+            if raw:
+                image_processed = torch.from_numpy(self._resize_raw(image))
+            else:
+                image_inputs = self.mm_encoder(ImageChunk(image=image))
+                image_processed = torch.tensor(image_inputs.image)
 
             images_processed.append(image_processed)
 
         return BatchFeature({"images": images_processed}, tensor_type=return_tensors)
+
+    def _resize_raw(self, image: Image.Image) -> np.ndarray:
+        """`mistral_common`'s resize without normalization, as (C, H, W)."""
+        import cv2
+
+        ncols, nrows = self.mm_encoder._image_to_num_tokens(image)
+        image_config = self.mm_encoder.image_config
+        token_size = image_config.image_patch_size * image_config.spatial_merge_size
+        pixels = np.asarray(_convert_to_rgb(image), dtype=np.int16)
+        resized = cv2.resize(
+            pixels * RAW_PIXEL_SCALE,
+            (ncols * token_size, nrows * token_size),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        return np.ascontiguousarray(resized.transpose(2, 0, 1))
 
     def get_number_of_image_patches(
         self,
